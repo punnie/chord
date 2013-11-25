@@ -11,9 +11,11 @@ end
 
 # Represents the local or remote node
 class Node
-  class << self
-    def get(id)
+  @@cache = {}
 
+  class << self
+    def get(id, host, port, connection = nil)
+      @@cache[id] ||= Node.new(id, host, port, connection)
     end
   end
 
@@ -25,6 +27,7 @@ class Node
     @port = port
 
     @connection = EventMachine.connect(host, port, NodeConnection)
+    @queue = EventMachine::Queue
   end
 
   # This is the messaging implementation
@@ -42,7 +45,7 @@ class Node
 
   def predecessor(closure)
     # Asks the node what is its predecessor
-    puts "--- asking #{@host}:#{@port} PREDECESSOR"
+    #puts "--- asking #{@host}:#{@port} PREDECESSOR"
 
     request = "REQ PREDECESSOR\n"
 
@@ -53,7 +56,7 @@ class Node
 
   def notify(id, node)
     # Notifies the node we're its predecessor
-    puts "--- sending #{@host}:#{@port} NOTIFY #{id}"
+    #puts "--- sending #{@host}:#{@port} NOTIFY #{id}"
 
     request = "REQ NOTIFY #{id} #{node.host}:#{node.port}\n"
 
@@ -66,17 +69,19 @@ class NodeConnection < EventMachine::Connection
   attr_accessor :request, :closure
 
   def receive_data(data)
-    puts "--- node received data: #{data.strip!}"
+    data.strip.split(/\n/).each do |d|
+      puts "--- node received data: #{d}"
 
-    if(data =~ /^!OK\sSUCCESSOR\s(\d+)\s(\w+):(\d+)/)
-      @closure.call(Node.new($1.to_i, $2, $3.to_i)) unless @closure.nil?
-    end
+      if(d =~ /^!OK\sSUCCESSOR\s(\d+)\s(\d+)\s(\w+):(\d+)/)
+        @closure.call(Node.get($2.to_i, $3, $4.to_i)) unless @closure.nil?
+      end
 
-    if(data =~ /^!OK\sPREDECESSOR\s(\d+)\s(\w+):(\d+)/)
-      @closure.call(Node.new($1.to_i, $2, $3.to_i)) unless @closure.nil?
-    end
+      if(d =~ /^!OK\sPREDECESSOR\s(\d+)\s(\w+):(\d+)/)
+        @closure.call(Node.get($1.to_i, $2, $3.to_i)) unless @closure.nil?
+      end
 
-    if(data =~ /^!OK\sNOTIFY/)
+      if(d =~ /^!OK\sNOTIFY/)
+      end
     end
   end
 
@@ -96,17 +101,13 @@ class Client
       id = 0
     end
 
-    @next = 0
-    @node_cache = {}
-
     # Creating a "server" to listen for incoming requests
     # The EVENT LOOP
-    EventMachine.run {
+    EventMachine.run do
       EventMachine.threadpool_size = 200
 
       # Creating this client's node object
-      @node = Node.new(id, "localhost", 10000 + id)
-      @node_cache[id] = @node
+      @node = Node.get(id, "localhost", 10000 + id)
 
       # While another client doesn't join a ring, this is pretty much true
       @predecessor = @node
@@ -130,32 +131,32 @@ class Client
         host = options.host.split(/:/).first
         port = options.host.split(/:/).last.to_i
         connection = EventMachine.connect(host, port, NodeConnection)
-        node = Node.new(nil, host, port, connection)
+        node = Node.get(nil, host, port, connection)
 
         join(node)
       end
 
-      faster = EventMachine::PeriodicTimer.new(1) do
-        fix_fingers()
-      end
-
       timer = EventMachine::PeriodicTimer.new(5) do
         stabilize()
+        fix_fingers()
         #check_predecessor()
 
         puts ">>> #{@successor.id}"
         puts "=== #{@node.id}"
         puts "<<< #{@predecessor.id unless @predecessor.nil?}"
+
+        @finger.each_with_index do |f, i|
+          puts "!!! | #{((@node.id + 2**i) % 2**Chord::BITS).to_s.rjust(4)} | #{f.id.to_s.rjust(4)} | #{f.host}:#{f.port} |"
+        end
       end
-    }
+    end
   end
 
   def find_successor(id, closure = nil)
     if(in_range?(id, @node.id, @successor.id))
       closure.call(@successor) unless closure.nil?
     else
-      closure ||= lambda { |res| puts res }
-      closest_preceding_node(id).find_successor(id, closure)
+      closest_preceding_node(id).find_successor(id, closure) unless closure.nil?
     end
   end
 
@@ -194,15 +195,15 @@ class Client
   end
 
   def fix_fingers()
-    @next = 0 if(@next >= Chord::BITS)
+    EventMachine::Iterator.new(0..(@finger.length-1)).each do |num, iter|
+      closure = lambda { |res|
+        @finger[num] = res
+        iter.next()
+      }
 
-    closure = lambda { |res|
-      puts "--- find successor #{@node.id + (2**(@next))}: #{res.id}"
-      @finger[@next] = res
-      @next = @next + 1
-     }
-
-    find_successor(@node.id + (2**(@next)), closure)
+      puts "Iteration number: #{num}"
+      find_successor((@node.id + (2**num)) % 2**Chord::BITS, closure)
+    end
   end
 
   def check_predecessor()
@@ -250,27 +251,29 @@ class ClientConnection < EventMachine::Connection
   end
 
   def receive_data(data)
-    puts "--- received data: #{data.strip!}"
+    data.strip.split(/\n/).each do |d|
+      puts "--- server received data: #{d}"
 
-    if(data =~ /^REQ\sSUCCESSOR\s(\d+)/)
-      closure = lambda { |res|
-        reply = "!OK SUCCESSOR #{res.id} #{res.host}:#{res.port}\n"
+      if(d =~ /^REQ\sSUCCESSOR\s(\d+)/)
+        closure = lambda { |res|
+          reply = "!OK SUCCESSOR #{$1.to_i} #{res.id} #{res.host}:#{res.port}\n"
+          send_data(reply)
+        }
+
+        @client.find_successor($1.to_i, closure)
+      end
+
+      if(d =~ /^REQ\sPREDECESSOR/)
+        reply = "!OK PREDECESSOR #{@client.predecessor.id} #{@client.predecessor.host}:#{@client.predecessor.port}\n"
         send_data(reply)
-      }
+      end
 
-      @client.find_successor($1.to_i, closure)
-    end
+      if(d =~ /^REQ\sNOTIFY\s(\d+)\s(\w+):(\d+)/)
+        @client.notify(Node.get($1.to_i, $2, $3.to_i))
 
-    if(data =~ /^REQ\sPREDECESSOR/)
-      reply = "!OK PREDECESSOR #{@client.predecessor.id} #{@client.predecessor.host}:#{@client.predecessor.port}\n"
-      send_data(reply)
-    end
-
-    if(data =~ /^REQ\sNOTIFY\s(\d+)\s(\w+):(\d+)/)
-      @client.notify(Node.new($1.to_i, $2, $3.to_i))
-
-      reply = "!OK NOTIFY\n"
-      send_data(reply)
+        reply = "!OK NOTIFY\n"
+        send_data(reply)
+      end
     end
   end
 
